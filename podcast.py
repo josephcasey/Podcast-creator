@@ -1,8 +1,18 @@
-"""PDF -> OpenRouter (script) -> OpenAI TTS (audio) podcast generator."""
+"""PDF -> podcast audio.
+
+Two modes:
+  * If the PDF already contains a speaker-tagged script (lines like "JAMIE:" /
+    "ALEX:"), parse it directly and skip OpenRouter.
+  * Otherwise, send the extracted text to OpenRouter to draft a two-host
+    dialogue, then synthesize.
+
+Audio is produced by OpenAI TTS, one segment per turn, concatenated to MP3.
+"""
 import argparse
 import json
 import os
 import pathlib
+import re
 import sys
 
 import requests
@@ -18,6 +28,19 @@ VOICE_A = os.environ.get("VOICE_A", "alloy")
 VOICE_B = os.environ.get("VOICE_B", "nova")
 PAUSE_MS = int(os.environ.get("PAUSE_MS", "350"))
 
+# Speaker tags treated as speaker A vs speaker B. Override via env if your
+# script uses different names (comma-separated, case-insensitive).
+SPEAKERS_A = [s.strip().upper() for s in os.environ.get("SPEAKERS_A", "JAMIE,HOST_A,A").split(",")]
+SPEAKERS_B = [s.strip().upper() for s in os.environ.get("SPEAKERS_B", "ALEX,HOST_B,B").split(",")]
+
+# Lines that look like section headers / production cues and should be dropped.
+HEADER_RE = re.compile(
+    r"^(COLD OPEN|SEGMENT\s+\d+.*|OUTRO|INTRO|PRODUCTION NOTES|NOTES FOR PRODUCTION.*|For TTS:.*)$",
+    re.IGNORECASE,
+)
+# Marker that ends the spoken portion of the script.
+END_MARKERS = ("[END]", "NOTES FOR PRODUCTION")
+
 
 def require_env(name: str) -> str:
     val = os.environ.get(name)
@@ -28,7 +51,61 @@ def require_env(name: str) -> str:
 
 def extract_pdf_text(path: pathlib.Path) -> str:
     reader = PdfReader(str(path))
-    return "\n\n".join((page.extract_text() or "") for page in reader.pages).strip()
+    return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+
+
+def parse_scripted_pdf(text: str) -> list[dict] | None:
+    """Return [{speaker, text}, ...] if the PDF already has speaker tags, else None."""
+    speaker_re = re.compile(
+        r"^(" + "|".join(re.escape(s) for s in SPEAKERS_A + SPEAKERS_B) + r"):\s*(.*)$",
+        re.IGNORECASE,
+    )
+    speakers_a = set(SPEAKERS_A)
+
+    turns: list[dict] = []
+    current: dict | None = None
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            current["text"] = re.sub(r"\s+", " ", current["text"]).strip()
+            # Truncate at end markers if present
+            for marker in END_MARKERS:
+                idx = current["text"].find(marker)
+                if idx != -1:
+                    current["text"] = current["text"][:idx].strip()
+            if current["text"]:
+                turns.append(current)
+        current = None
+
+    stopped = False
+    for raw in text.splitlines():
+        ln = raw.strip()
+        if not ln or stopped:
+            if stopped:
+                break
+            continue
+        # If a line contains an end marker outside of any speaker turn, stop.
+        if any(m in ln for m in END_MARKERS) and current is None:
+            stopped = True
+            continue
+        m = speaker_re.match(ln)
+        if m:
+            flush()
+            tag = m.group(1).upper()
+            current = {
+                "speaker": "A" if tag in speakers_a else "B",
+                "text": m.group(2),
+            }
+            continue
+        if HEADER_RE.match(ln):
+            flush()
+            continue
+        if current is not None:
+            current["text"] += " " + ln
+    flush()
+
+    return turns if len(turns) >= 4 else None
 
 
 SCRIPT_PROMPT = """You are a podcast scriptwriter. Turn the document below into a natural two-host dialogue.
@@ -52,10 +129,7 @@ SOURCE DOCUMENT:
 def generate_script(text: str, api_key: str) -> list[dict]:
     resp = requests.post(
         OPENROUTER_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
             "model": OPENROUTER_MODEL,
             "messages": [{"role": "user", "content": SCRIPT_PROMPT.format(text=text)}],
@@ -70,7 +144,7 @@ def generate_script(text: str, api_key: str) -> list[dict]:
         return data["dialogue"]
     if isinstance(data, list):
         return data
-    for v in data.values() if isinstance(data, dict) else []:
+    for v in (data.values() if isinstance(data, dict) else []):
         if isinstance(v, list):
             return v
     sys.exit(f"Unexpected script JSON shape: {content[:200]}")
@@ -79,10 +153,7 @@ def generate_script(text: str, api_key: str) -> list[dict]:
 def synthesize(text: str, voice: str, api_key: str, out_path: pathlib.Path) -> None:
     resp = requests.post(
         OPENAI_TTS_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
             "model": TTS_MODEL,
             "voice": voice,
@@ -100,7 +171,13 @@ def main() -> None:
     ap.add_argument("pdf", help="Path to source PDF")
     ap.add_argument("-o", "--output", default="podcast.mp3", help="Output MP3 path")
     ap.add_argument("--script-only", action="store_true", help="Generate JSON script, skip TTS")
-    ap.add_argument("--script", help="Use existing JSON script instead of regenerating from PDF")
+    ap.add_argument("--script", help="Use existing JSON script instead of the PDF")
+    ap.add_argument("--limit", type=int, help="Only synthesize first N turns (for previewing)")
+    ap.add_argument(
+        "--force-llm",
+        action="store_true",
+        help="Ignore speaker tags in PDF and route through OpenRouter to draft a new script",
+    )
     args = ap.parse_args()
 
     pdf_path = pathlib.Path(args.pdf)
@@ -108,24 +185,32 @@ def main() -> None:
     script_path = out_path.with_suffix(".json")
 
     if args.script:
-        dialogue = json.loads(pathlib.Path(args.script).read_text())
-        if isinstance(dialogue, dict) and "dialogue" in dialogue:
-            dialogue = dialogue["dialogue"]
+        loaded = json.loads(pathlib.Path(args.script).read_text())
+        dialogue = loaded["dialogue"] if isinstance(loaded, dict) and "dialogue" in loaded else loaded
     else:
         if not pdf_path.is_file():
             sys.exit(f"PDF not found: {pdf_path}")
-        openrouter_key = require_env("OPENROUTER_API_KEY")
-
         print(f"Extracting text from {pdf_path}...")
         text = extract_pdf_text(pdf_path)
         if not text:
             sys.exit("No text extracted from PDF (scanned/image-only PDFs need OCR).")
         print(f"  {len(text):,} chars extracted")
 
-        print(f"Generating script via OpenRouter ({OPENROUTER_MODEL})...")
-        dialogue = generate_script(text, openrouter_key)
+        dialogue = None if args.force_llm else parse_scripted_pdf(text)
+        if dialogue:
+            print(f"  detected scripted PDF: {len(dialogue)} turns parsed directly (no LLM call)")
+        else:
+            openrouter_key = require_env("OPENROUTER_API_KEY")
+            print(f"Generating script via OpenRouter ({OPENROUTER_MODEL})...")
+            dialogue = generate_script(text, openrouter_key)
+            print(f"  {len(dialogue)} turns generated")
+
         script_path.write_text(json.dumps({"dialogue": dialogue}, indent=2))
-        print(f"  wrote {script_path} ({len(dialogue)} turns)")
+        print(f"  wrote {script_path}")
+
+    if args.limit:
+        dialogue = dialogue[: args.limit]
+        print(f"  --limit {args.limit}: rendering first {len(dialogue)} turns only")
 
     if args.script_only:
         return
@@ -134,15 +219,20 @@ def main() -> None:
     work = out_path.parent / f"{out_path.stem}_segments"
     work.mkdir(parents=True, exist_ok=True)
 
-    print(f"Synthesizing {len(dialogue)} turns with OpenAI TTS ({TTS_MODEL})...")
+    total_chars = sum(len(t["text"]) for t in dialogue)
+    print(
+        f"Synthesizing {len(dialogue)} turns ({total_chars:,} chars) "
+        f"with OpenAI TTS ({TTS_MODEL})..."
+    )
     segments: list[AudioSegment] = []
     for i, turn in enumerate(dialogue):
         speaker = str(turn["speaker"]).upper()
         voice = VOICE_A if speaker == "A" else VOICE_B
         seg_path = work / f"{i:03d}_{speaker}.mp3"
         preview = turn["text"][:70].replace("\n", " ")
-        print(f"  [{i + 1:>2}/{len(dialogue)}] {speaker} ({voice}): {preview}...")
-        synthesize(turn["text"], voice, openai_key, seg_path)
+        print(f"  [{i + 1:>3}/{len(dialogue)}] {speaker} ({voice}): {preview}...")
+        if not seg_path.exists():  # cheap resume on re-runs
+            synthesize(turn["text"], voice, openai_key, seg_path)
         segments.append(AudioSegment.from_mp3(seg_path))
 
     pause = AudioSegment.silent(duration=PAUSE_MS)
