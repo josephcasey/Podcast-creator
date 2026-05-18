@@ -1,3 +1,4 @@
 pypdf>=4.0
 requests>=2.31
 pydub>=0.25
+edge-tts>=7.0

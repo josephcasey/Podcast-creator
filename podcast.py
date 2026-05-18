@@ -6,27 +6,49 @@ Two modes:
   * Otherwise, send the extracted text to OpenRouter to draft a two-host
     dialogue, then synthesize.
 
-Audio is produced by OpenAI TTS, one segment per turn, concatenated to MP3.
+Audio backends: edge-tts (free, no key, default) or OpenAI TTS (--tts openai).
+One segment per turn, concatenated to MP3.
 """
 import argparse
+import asyncio
 import json
 import os
 import pathlib
 import re
+import ssl
 import sys
 
+import edge_tts
+import edge_tts.communicate
 import requests
 from pydub import AudioSegment
 from pypdf import PdfReader
+
+# edge_tts hard-codes its SSL context to certifi's bundle, which excludes some
+# corporate / egress-proxy CAs. If a system bundle is available (via
+# SSL_CERT_FILE), rebuild the context against it so it trusts the local proxy.
+_system_ca = os.environ.get("SSL_CERT_FILE") if "SSL_CERT_FILE" in os.environ else None
+if _system_ca and os.path.isfile(_system_ca):
+    edge_tts.communicate._SSL_CTX = ssl.create_default_context(cafile=_system_ca)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
 
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
 TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "tts-1")
-VOICE_A = os.environ.get("VOICE_A", "alloy")
-VOICE_B = os.environ.get("VOICE_B", "nova")
 PAUSE_MS = int(os.environ.get("PAUSE_MS", "350"))
+
+# Per-backend default voice pairs (A = JAMIE/host_a, B = ALEX/host_b).
+VOICE_DEFAULTS = {
+    "edge": {
+        "A": os.environ.get("EDGE_VOICE_A", "en-US-AndrewMultilingualNeural"),
+        "B": os.environ.get("EDGE_VOICE_B", "en-US-AvaMultilingualNeural"),
+    },
+    "openai": {
+        "A": os.environ.get("VOICE_A", "alloy"),
+        "B": os.environ.get("VOICE_B", "nova"),
+    },
+}
 
 # Speaker tags treated as speaker A vs speaker B. Override via env if your
 # script uses different names (comma-separated, case-insensitive).
@@ -150,7 +172,7 @@ def generate_script(text: str, api_key: str) -> list[dict]:
     sys.exit(f"Unexpected script JSON shape: {content[:200]}")
 
 
-def synthesize(text: str, voice: str, api_key: str, out_path: pathlib.Path) -> None:
+def synthesize_openai(text: str, voice: str, api_key: str, out_path: pathlib.Path) -> None:
     resp = requests.post(
         OPENAI_TTS_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -166,6 +188,14 @@ def synthesize(text: str, voice: str, api_key: str, out_path: pathlib.Path) -> N
     out_path.write_bytes(resp.content)
 
 
+async def _edge_save(text: str, voice: str, out_path: pathlib.Path) -> None:
+    await edge_tts.Communicate(text, voice).save(str(out_path))
+
+
+def synthesize_edge(text: str, voice: str, out_path: pathlib.Path) -> None:
+    asyncio.run(_edge_save(text, voice, out_path))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("pdf", help="Path to source PDF")
@@ -178,7 +208,14 @@ def main() -> None:
         action="store_true",
         help="Ignore speaker tags in PDF and route through OpenRouter to draft a new script",
     )
+    ap.add_argument(
+        "--tts",
+        choices=("edge", "openai"),
+        default=os.environ.get("TTS_BACKEND", "edge"),
+        help="TTS backend: 'edge' (free, default) or 'openai' (needs OPENAI_API_KEY)",
+    )
     args = ap.parse_args()
+    voices = VOICE_DEFAULTS[args.tts]
 
     pdf_path = pathlib.Path(args.pdf)
     out_path = pathlib.Path(args.output)
@@ -215,24 +252,27 @@ def main() -> None:
     if args.script_only:
         return
 
-    openai_key = require_env("OPENAI_API_KEY")
+    openai_key = require_env("OPENAI_API_KEY") if args.tts == "openai" else None
     work = out_path.parent / f"{out_path.stem}_segments"
     work.mkdir(parents=True, exist_ok=True)
 
     total_chars = sum(len(t["text"]) for t in dialogue)
-    print(
-        f"Synthesizing {len(dialogue)} turns ({total_chars:,} chars) "
-        f"with OpenAI TTS ({TTS_MODEL})..."
+    backend_label = (
+        f"OpenAI TTS ({TTS_MODEL})" if args.tts == "openai" else f"edge-tts ({voices['A']} / {voices['B']})"
     )
+    print(f"Synthesizing {len(dialogue)} turns ({total_chars:,} chars) with {backend_label}...")
     segments: list[AudioSegment] = []
     for i, turn in enumerate(dialogue):
         speaker = str(turn["speaker"]).upper()
-        voice = VOICE_A if speaker == "A" else VOICE_B
+        voice = voices.get(speaker, voices["A"])
         seg_path = work / f"{i:03d}_{speaker}.mp3"
         preview = turn["text"][:70].replace("\n", " ")
         print(f"  [{i + 1:>3}/{len(dialogue)}] {speaker} ({voice}): {preview}...")
         if not seg_path.exists():  # cheap resume on re-runs
-            synthesize(turn["text"], voice, openai_key, seg_path)
+            if args.tts == "openai":
+                synthesize_openai(turn["text"], voice, openai_key, seg_path)
+            else:
+                synthesize_edge(turn["text"], voice, seg_path)
         segments.append(AudioSegment.from_mp3(seg_path))
 
     pause = AudioSegment.silent(duration=PAUSE_MS)

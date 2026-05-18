@@ -5,3 +5,5 @@ __pycache__/
 *_segments/
 input.pdf
 podcast.json
+preview.json
+*.json
