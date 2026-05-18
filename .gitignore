@@ -4,3 +4,4 @@ __pycache__/
 *.mp3
 *_segments/
 input.pdf
+podcast.json
