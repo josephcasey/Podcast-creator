@@ -20,6 +20,7 @@ import sys
 
 import edge_tts
 import edge_tts.communicate
+import edge_tts.voices
 import requests
 from pydub import AudioSegment
 from pypdf import PdfReader
@@ -29,7 +30,9 @@ from pypdf import PdfReader
 # SSL_CERT_FILE), rebuild the context against it so it trusts the local proxy.
 _system_ca = os.environ.get("SSL_CERT_FILE") if "SSL_CERT_FILE" in os.environ else None
 if _system_ca and os.path.isfile(_system_ca):
-    edge_tts.communicate._SSL_CTX = ssl.create_default_context(cafile=_system_ca)
+    _ctx = ssl.create_default_context(cafile=_system_ca)
+    edge_tts.communicate._SSL_CTX = _ctx
+    edge_tts.voices._SSL_CTX = _ctx
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
@@ -41,8 +44,8 @@ PAUSE_MS = int(os.environ.get("PAUSE_MS", "350"))
 # Per-backend default voice pairs (A = JAMIE/host_a, B = ALEX/host_b).
 VOICE_DEFAULTS = {
     "edge": {
-        "A": os.environ.get("EDGE_VOICE_A", "en-US-AndrewMultilingualNeural"),
-        "B": os.environ.get("EDGE_VOICE_B", "en-US-AvaMultilingualNeural"),
+        "A": os.environ.get("EDGE_VOICE_A", "en-GB-SoniaNeural"),
+        "B": os.environ.get("EDGE_VOICE_B", "en-AU-NatashaNeural"),
     },
     "openai": {
         "A": os.environ.get("VOICE_A", "alloy"),
