@@ -44,8 +44,8 @@ PAUSE_MS = int(os.environ.get("PAUSE_MS", "350"))
 # Per-backend default voice pairs (A = JAMIE/host_a, B = ALEX/host_b).
 VOICE_DEFAULTS = {
     "edge": {
-        "A": os.environ.get("EDGE_VOICE_A", "en-GB-SoniaNeural"),
-        "B": os.environ.get("EDGE_VOICE_B", "en-AU-NatashaNeural"),
+        "A": os.environ.get("EDGE_VOICE_A", "en-US-AndrewMultilingualNeural"),
+        "B": os.environ.get("EDGE_VOICE_B", "en-US-AvaMultilingualNeural"),
     },
     "openai": {
         "A": os.environ.get("VOICE_A", "alloy"),
@@ -195,8 +195,21 @@ async def _edge_save(text: str, voice: str, out_path: pathlib.Path) -> None:
     await edge_tts.Communicate(text, voice).save(str(out_path))
 
 
-def synthesize_edge(text: str, voice: str, out_path: pathlib.Path) -> None:
-    asyncio.run(_edge_save(text, voice, out_path))
+def synthesize_edge(text: str, voice: str, out_path: pathlib.Path, attempts: int = 4) -> None:
+    """edge-tts sometimes returns NoAudioReceived; retry with backoff."""
+    last_err: Exception | None = None
+    for i in range(attempts):
+        try:
+            asyncio.run(_edge_save(text, voice, out_path))
+            return
+        except edge_tts.exceptions.NoAudioReceived as e:
+            last_err = e
+            wait = 2 ** i
+            print(f"    edge-tts NoAudioReceived (try {i + 1}/{attempts}), retrying in {wait}s...")
+            import time as _t
+            _t.sleep(wait)
+    assert last_err is not None
+    raise last_err
 
 
 def main() -> None:
@@ -271,11 +284,15 @@ def main() -> None:
         seg_path = work / f"{i:03d}_{speaker}.mp3"
         preview = turn["text"][:70].replace("\n", " ")
         print(f"  [{i + 1:>3}/{len(dialogue)}] {speaker} ({voice}): {preview}...")
-        if not seg_path.exists():  # cheap resume on re-runs
+        if not (seg_path.exists() and seg_path.stat().st_size > 0):
+            seg_path.unlink(missing_ok=True)
             if args.tts == "openai":
                 synthesize_openai(turn["text"], voice, openai_key, seg_path)
             else:
                 synthesize_edge(turn["text"], voice, seg_path)
+            if seg_path.stat().st_size == 0:
+                seg_path.unlink(missing_ok=True)
+                sys.exit(f"TTS produced empty file for turn {i + 1}; aborting.")
         segments.append(AudioSegment.from_mp3(seg_path))
 
     pause = AudioSegment.silent(duration=PAUSE_MS)
